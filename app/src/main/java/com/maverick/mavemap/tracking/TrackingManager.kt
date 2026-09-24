@@ -59,7 +59,7 @@ class TrackingManager(
     private var yaw = ""
     private var pitch = ""
     private var roll = ""
-    private var lastSensorTimestampNs = 0L
+    private var gnssMeasurementDetails = ""
 
     private val sensorTypes = intArrayOf(
         Sensor.TYPE_ACCELEROMETER,
@@ -100,7 +100,9 @@ class TrackingManager(
                             "state=${measurement.state}",
                             "multipath=${measurement.multipathIndicator}"
                         ).joinToString("|")
-                        writeRow("gnss_measurement", event.clock.timeNanos, fields)
+                        synchronized(lock) {
+                            gnssMeasurementDetails = fields
+                        }
                     }
                 }
             }
@@ -211,14 +213,12 @@ class TrackingManager(
             if (previous == null || previous.distanceToAsDouble(point) <= 300.0) {
                 trackPoints.add(TrackPoint(point, location.time, location.altitude))
             }
-            writeRow("location", location.elapsedRealtimeNanos, "")
         }
     }
 
     override fun onSensorChanged(event: SensorEvent) {
         synchronized(lock) {
             if (!tracking) return
-            lastSensorTimestampNs = event.timestamp
             values[event.sensor.type] = event.values.copyOf()
             accuracy[event.sensor.type] = event.accuracy
             when (event.sensor.type) {
@@ -228,7 +228,9 @@ class TrackingManager(
                 }
                 Sensor.TYPE_GAME_ROTATION_VECTOR -> gameRotationVector = event.values.csv(4)
             }
-            writeRow("sensor_${event.sensor.stringType}", event.timestamp, "")
+            if (event.sensor.type == Sensor.TYPE_ROTATION_VECTOR) {
+                enqueueSampleRow(buildSampleRow(event.timestamp))
+            }
         }
     }
 
@@ -260,16 +262,13 @@ class TrackingManager(
         sensorManager.unregisterListener(this)
     }
 
-    private fun writeRow(eventType: String, eventTimestampNs: Long, extra: String) {
+    private fun enqueueSampleRow(line: String) {
         val targetWriter: BufferedWriter
         synchronized(lock) {
             targetWriter = writer ?: return
         }
         writerExecutor.submit {
             try {
-                val line = synchronized(lock) {
-                    buildRow(eventType, eventTimestampNs, extra)
-                }
                 targetWriter.write(line)
                 targetWriter.newLine()
             } catch (exception: Exception) {
@@ -278,24 +277,31 @@ class TrackingManager(
         }
     }
 
-    private fun buildRow(eventType: String, eventTimestampNs: Long, extra: String): String {
+    private fun buildSampleRow(eventTimestampNs: Long): String {
         val location = latestLocation
         val elapsed = if (sessionStartNs == 0L) "" else (eventTimestampNs - sessionStartNs).toString()
-        val accel = values[Sensor.TYPE_ACCELEROMETER].csv(3)
-        val gyro = values[Sensor.TYPE_GYROSCOPE].csv(3)
-        val gravity = values[Sensor.TYPE_GRAVITY].csv(3)
-        val linear = values[Sensor.TYPE_LINEAR_ACCELERATION].csv(3)
-        val magnetic = values[Sensor.TYPE_MAGNETIC_FIELD].csv(3)
-        val rotation = values[Sensor.TYPE_ROTATION_VECTOR].csv(4)
-        val gameRotation = values[Sensor.TYPE_GAME_ROTATION_VECTOR].csv(4)
+        val accel = values[Sensor.TYPE_ACCELEROMETER]
+        val gyro = values[Sensor.TYPE_GYROSCOPE]
+        val gravity = values[Sensor.TYPE_GRAVITY]
+        val linear = values[Sensor.TYPE_LINEAR_ACCELERATION]
+        val magnetic = values[Sensor.TYPE_MAGNETIC_FIELD]
+        val rotation = values[Sensor.TYPE_ROTATION_VECTOR]
+        val gameRotation = values[Sensor.TYPE_GAME_ROTATION_VECTOR]
         return listOf(
-            dateFormat.format(Date()), elapsed, eventTimestampNs.toString(), eventType,
+            dateFormat.format(Date()), elapsed, eventTimestampNs.toString(), "sample",
             location?.latitude.csv(), location?.longitude.csv(), location?.altitude.csv(),
             location?.speed.csv(), location?.bearing.csv(), location?.accuracy.csv(),
             location?.verticalAccuracy(), location?.speedAccuracy(), location?.bearingAccuracy(),
             location?.provider.orEmpty(), satellitesVisible, satellitesUsed,
-            accel, gyro, gravity, linear, magnetic, rotation, gameRotation,
-            yaw, pitch, roll, accuracy.values.maxOrNull()?.toString().orEmpty(), extra
+            satellitesVisible, satellitesUsed, gnssMeasurementDetails,
+            accel.component(0), accel.component(1), accel.component(2),
+            gyro.component(0), gyro.component(1), gyro.component(2),
+            gravity.component(0), gravity.component(1), gravity.component(2),
+            linear.component(0), linear.component(1), linear.component(2),
+            magnetic.component(0), magnetic.component(1), magnetic.component(2),
+            rotation.component(0), rotation.component(1), rotation.component(2), rotation.component(3),
+            gameRotation.component(0), gameRotation.component(1), gameRotation.component(2), gameRotation.component(3),
+            yaw, pitch, roll, accuracy.values.maxOrNull()?.toString().orEmpty()
         ).joinToString(",") { quoteCsv(it.orEmpty()) }
     }
 
@@ -336,6 +342,8 @@ class TrackingManager(
     private fun String?.csv(): String = this.orEmpty()
     private fun FloatArray?.csv(size: Int): String =
         if (this == null) "" else (0 until minOf(size, this.size)).joinToString("|") { this[it].toString() }
+    private fun FloatArray?.component(index: Int): String =
+        if (this != null && index < size) this[index].toString() else ""
     private fun Float?.csv(): String = this?.toString().orEmpty()
     private fun Double?.csv(): String = this?.toString().orEmpty()
     private fun Location?.verticalAccuracy(): String =
@@ -370,6 +378,6 @@ class TrackingManager(
 
     companion object {
         private const val TAG = "TrackingManager"
-        private const val HEADER = "timestamp_utc,elapsed_realtime_ns,event_timestamp_ns,event_type,latitude,longitude,altitude_m,speed_mps,bearing_deg,horizontal_accuracy_m,vertical_accuracy_m,speed_accuracy_mps,bearing_accuracy_deg,provider,satellites_visible,satellites_used,accelerometer_xyz,gyroscope_xyz,gravity_xyz,linear_acceleration_xyz,magnetic_field_xyz,rotation_vector,game_rotation_vector,yaw,pitch,roll,sensor_accuracy,extra"
+        private const val HEADER = "timestamp_utc,elapsed_realtime_ns,event_timestamp_ns,event_type,latitude,longitude,altitude_m,speed_mps,bearing_deg,horizontal_accuracy_m,vertical_accuracy_m,speed_accuracy_mps,bearing_accuracy_deg,provider,satellites_visible,satellites_used,gnss_measurement,accelerometer_x,accelerometer_y,accelerometer_z,gyroscope_x,gyroscope_y,gyroscope_z,gravity_x,gravity_y,gravity_z,linear_acceleration_x,linear_acceleration_y,linear_acceleration_z,magnetic_field_x,magnetic_field_y,magnetic_field_z,rotation_vector_x,rotation_vector_y,rotation_vector_z,rotation_vector_w,game_rotation_vector_x,game_rotation_vector_y,game_rotation_vector_z,game_rotation_vector_w,yaw,pitch,roll,sensor_accuracy"
     }
 }
