@@ -1,0 +1,303 @@
+package com.maverick.mavemap.tracking
+
+import android.content.Context
+import android.hardware.Sensor
+import android.hardware.SensorEvent
+import android.hardware.SensorEventListener
+import android.hardware.SensorManager
+import android.location.GnssMeasurementsEvent
+import android.location.GnssStatus
+import android.location.Location
+import android.location.LocationManager
+import android.os.Build
+import android.os.SystemClock
+import android.util.Log
+import java.io.BufferedWriter
+import java.io.File
+import java.io.FileWriter
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+import java.util.TimeZone
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
+
+class TrackingManager(
+    context: Context
+) : SensorEventListener {
+    interface Listener {
+        fun onTrackingChanged(tracking: Boolean, file: File?)
+    }
+
+    private val appContext = context.applicationContext
+    private val sensorManager =
+        appContext.getSystemService(Context.SENSOR_SERVICE) as SensorManager
+    private val locationManager =
+        appContext.getSystemService(Context.LOCATION_SERVICE) as LocationManager
+    private val writerExecutor: ExecutorService = Executors.newSingleThreadExecutor()
+    private val dateFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US).apply {
+        timeZone = TimeZone.getTimeZone("UTC")
+    }
+    private val lock = Any()
+    private var writer: BufferedWriter? = null
+    private var sessionStartNs = 0L
+    private var sessionFile: File? = null
+    private var latestLocation: Location? = null
+    private var satellitesVisible = ""
+    private var satellitesUsed = ""
+    private var tracking = false
+    private var listener: Listener? = null
+
+    private val values = mutableMapOf<Int, FloatArray>()
+    private val accuracy = mutableMapOf<Int, Int>()
+    private var rotationVector = ""
+    private var gameRotationVector = ""
+    private var yaw = ""
+    private var pitch = ""
+    private var roll = ""
+    private var lastSensorTimestampNs = 0L
+
+    private val sensorTypes = intArrayOf(
+        Sensor.TYPE_ACCELEROMETER,
+        Sensor.TYPE_GYROSCOPE,
+        Sensor.TYPE_GRAVITY,
+        Sensor.TYPE_LINEAR_ACCELERATION,
+        Sensor.TYPE_MAGNETIC_FIELD,
+        Sensor.TYPE_ROTATION_VECTOR,
+        Sensor.TYPE_GAME_ROTATION_VECTOR
+    )
+
+    private val gnssCallback = object : GnssStatus.Callback() {
+        override fun onSatelliteStatusChanged(status: GnssStatus) {
+            if (!tracking) return
+            var visible = 0
+            var used = 0
+            for (index in 0 until status.satelliteCount) {
+                visible++
+                if (status.usedInFix(index)) used++
+            }
+            satellitesVisible = visible.toString()
+            satellitesUsed = used.toString()
+        }
+    }
+
+    private val measurementsCallback = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+        object : GnssMeasurementsEvent.Callback() {
+            override fun onGnssMeasurementsReceived(event: GnssMeasurementsEvent) {
+                if (tracking) {
+                    event.measurements.forEach { measurement ->
+                        val fields = listOf(
+                            "constellation=${measurement.constellationType}",
+                            "svid=${measurement.svid}",
+                            "carrier_hz=${if (measurement.hasCarrierFrequencyHz()) measurement.carrierFrequencyHz else ""}",
+                            "cn0_dbhz=${measurement.cn0DbHz}",
+                            "azimuth_deg=",
+                            "elevation_deg=",
+                            "state=${measurement.state}",
+                            "multipath=${measurement.multipathIndicator}"
+                        ).joinToString("|")
+                        writeRow("gnss_measurement", event.clock.timeNanos, fields)
+                    }
+                }
+            }
+        }
+    } else {
+        null
+    }
+
+    fun setListener(listener: Listener?) {
+        this.listener = listener
+    }
+
+    val isTracking: Boolean
+        @Synchronized get() = tracking
+
+    fun start(): File? {
+        synchronized(lock) {
+            if (tracking) return sessionFile
+            val directory = File(appContext.getExternalFilesDir(null), "tracks")
+            if (!directory.exists() && !directory.mkdirs()) {
+                Log.e(TAG, "Unable to create tracking directory")
+                return null
+            }
+            val file = File(directory, "track_${System.currentTimeMillis()}.csv")
+            try {
+                writer = BufferedWriter(FileWriter(file, false))
+                writer?.write(HEADER)
+                writer?.newLine()
+                writer?.flush()
+            } catch (exception: Exception) {
+                Log.e(TAG, "Unable to start tracking", exception)
+                writer?.closeQuietly()
+                writer = null
+                return null
+            }
+            sessionFile = file
+            sessionStartNs = SystemClock.elapsedRealtimeNanos()
+            tracking = true
+            registerSensors()
+            try {
+                locationManager.registerGnssStatusCallback(gnssCallback)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N && measurementsCallback != null) {
+                    locationManager.registerGnssMeasurementsCallback(measurementsCallback)
+                }
+            } catch (exception: SecurityException) {
+                Log.w(TAG, "GNSS callbacks unavailable", exception)
+            }
+            listener?.onTrackingChanged(true, file)
+            return file
+        }
+    }
+
+    fun stop() {
+        synchronized(lock) {
+            if (!tracking) return
+            tracking = false
+            unregisterSensors()
+            try {
+                locationManager.unregisterGnssStatusCallback(gnssCallback)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N && measurementsCallback != null) {
+                    locationManager.unregisterGnssMeasurementsCallback(measurementsCallback)
+                }
+            } catch (exception: Exception) {
+                Log.w(TAG, "Unable to unregister GNSS callbacks", exception)
+            }
+            val closingWriter = writer
+            writer = null
+            writerExecutor.submit {
+                closingWriter?.let {
+                    try {
+                        it.flush()
+                        it.closeQuietly()
+                    } catch (exception: Exception) {
+                        Log.e(TAG, "Unable to close tracking file", exception)
+                    }
+                }
+            }
+            listener?.onTrackingChanged(false, sessionFile)
+        }
+    }
+
+    fun recordLocation(location: Location) {
+        synchronized(lock) {
+            if (!tracking) return
+            latestLocation = Location(location)
+            writeRow("location", location.elapsedRealtimeNanos, "")
+        }
+    }
+
+    override fun onSensorChanged(event: SensorEvent) {
+        synchronized(lock) {
+            if (!tracking) return
+            lastSensorTimestampNs = event.timestamp
+            values[event.sensor.type] = event.values.copyOf()
+            accuracy[event.sensor.type] = event.accuracy
+            when (event.sensor.type) {
+                Sensor.TYPE_ROTATION_VECTOR -> {
+                    rotationVector = event.values.csv(4)
+                    updateOrientation(event.values)
+                }
+                Sensor.TYPE_GAME_ROTATION_VECTOR -> gameRotationVector = event.values.csv(4)
+            }
+            writeRow("sensor_${event.sensor.stringType}", event.timestamp, "")
+        }
+    }
+
+    override fun onAccuracyChanged(sensor: Sensor, accuracyValue: Int) {
+        synchronized(lock) {
+            accuracy[sensor.type] = accuracyValue
+        }
+    }
+
+    private fun updateOrientation(values: FloatArray) {
+        val matrix = FloatArray(9)
+        val orientation = FloatArray(3)
+        SensorManager.getRotationMatrixFromVector(matrix, values)
+        SensorManager.getOrientation(matrix, orientation)
+        yaw = Math.toDegrees(orientation[0].toDouble()).toFloat().toString()
+        pitch = Math.toDegrees(orientation[1].toDouble()).toFloat().toString()
+        roll = Math.toDegrees(orientation[2].toDouble()).toFloat().toString()
+    }
+
+    private fun registerSensors() {
+        sensorTypes.forEach { type ->
+            sensorManager.getDefaultSensor(type)?.let {
+                sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME)
+            }
+        }
+    }
+
+    private fun unregisterSensors() {
+        sensorManager.unregisterListener(this)
+    }
+
+    private fun writeRow(eventType: String, eventTimestampNs: Long, extra: String) {
+        val targetWriter: BufferedWriter
+        val line: String
+        synchronized(lock) {
+            targetWriter = writer ?: return
+            line = buildRow(eventType, eventTimestampNs, extra)
+        }
+        writerExecutor.submit {
+            try {
+                targetWriter.write(line)
+                targetWriter.newLine()
+                targetWriter.flush()
+            } catch (exception: Exception) {
+                Log.e(TAG, "Unable to write tracking row", exception)
+            }
+        }
+    }
+
+    private fun buildRow(eventType: String, eventTimestampNs: Long, extra: String): String {
+        val location = latestLocation
+        val elapsed = if (sessionStartNs == 0L) "" else (eventTimestampNs - sessionStartNs).toString()
+        val accel = values[Sensor.TYPE_ACCELEROMETER].csv(3)
+        val gyro = values[Sensor.TYPE_GYROSCOPE].csv(3)
+        val gravity = values[Sensor.TYPE_GRAVITY].csv(3)
+        val linear = values[Sensor.TYPE_LINEAR_ACCELERATION].csv(3)
+        val magnetic = values[Sensor.TYPE_MAGNETIC_FIELD].csv(3)
+        val rotation = values[Sensor.TYPE_ROTATION_VECTOR].csv(4)
+        val gameRotation = values[Sensor.TYPE_GAME_ROTATION_VECTOR].csv(4)
+        return listOf(
+            dateFormat.format(Date()), elapsed, eventTimestampNs.toString(), eventType,
+            location?.latitude.csv(), location?.longitude.csv(), location?.altitude.csv(),
+            location?.speed.csv(), location?.bearing.csv(), location?.accuracy.csv(),
+            location?.verticalAccuracy(), location?.speedAccuracy(), location?.bearingAccuracy(),
+            location?.provider.orEmpty(), satellitesVisible, satellitesUsed,
+            accel, gyro, gravity, linear, magnetic, rotation, gameRotation,
+            yaw, pitch, roll, accuracy.values.maxOrNull()?.toString().orEmpty(), extra
+        ).joinToString(",") { quoteCsv(it.orEmpty()) }
+    }
+
+    fun close() {
+        stop()
+        writerExecutor.shutdown()
+    }
+
+    private fun String?.csv(): String = this.orEmpty()
+    private fun FloatArray?.csv(size: Int): String =
+        if (this == null) "" else (0 until minOf(size, this.size)).joinToString("|") { this[it].toString() }
+    private fun Float?.csv(): String = this?.toString().orEmpty()
+    private fun Double?.csv(): String = this?.toString().orEmpty()
+    private fun Location?.verticalAccuracy(): String =
+        if (this != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && hasVerticalAccuracy()) verticalAccuracyMeters.toString() else ""
+    private fun Location?.speedAccuracy(): String =
+        if (this != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && hasSpeedAccuracy()) speedAccuracyMetersPerSecond.toString() else ""
+    private fun Location?.bearingAccuracy(): String =
+        if (this != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && hasBearingAccuracy()) bearingAccuracyDegrees.toString() else ""
+    private fun quoteCsv(value: String): String =
+        if (value.any { it == ',' || it == '"' || it == '\n' }) {
+            "\"${value.replace("\"", "\"\"")}\""
+        } else {
+            value
+        }
+    private fun BufferedWriter.closeQuietly() {
+        try { close() } catch (_: Exception) { }
+    }
+
+    companion object {
+        private const val TAG = "TrackingManager"
+        private const val HEADER = "timestamp_utc,elapsed_realtime_ns,event_timestamp_ns,event_type,latitude,longitude,altitude_m,speed_mps,bearing_deg,horizontal_accuracy_m,vertical_accuracy_m,speed_accuracy_mps,bearing_accuracy_deg,provider,satellites_visible,satellites_used,accelerometer_xyz,gyroscope_xyz,gravity_xyz,linear_acceleration_xyz,magnetic_field_xyz,rotation_vector,game_rotation_vector,yaw,pitch,roll,sensor_accuracy,extra"
+    }
+}
