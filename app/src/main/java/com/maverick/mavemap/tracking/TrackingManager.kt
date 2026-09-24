@@ -262,16 +262,16 @@ class TrackingManager(
 
     private fun writeRow(eventType: String, eventTimestampNs: Long, extra: String) {
         val targetWriter: BufferedWriter
-        val line: String
         synchronized(lock) {
             targetWriter = writer ?: return
-            line = buildRow(eventType, eventTimestampNs, extra)
         }
         writerExecutor.submit {
             try {
+                val line = synchronized(lock) {
+                    buildRow(eventType, eventTimestampNs, extra)
+                }
                 targetWriter.write(line)
                 targetWriter.newLine()
-                targetWriter.flush()
             } catch (exception: Exception) {
                 Log.e(TAG, "Unable to write tracking row", exception)
             }

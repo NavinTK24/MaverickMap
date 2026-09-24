@@ -6,6 +6,7 @@ import android.hardware.SensorEventListener
 import android.hardware.SensorManager
 import android.location.Location
 import android.os.Bundle
+import android.os.SystemClock
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -54,6 +55,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     private var gnssStateListener: ((Boolean) -> Unit)? = null
     private var composeCompassHeading by mutableFloatStateOf(0f)
     private var composeCompassDirection by mutableStateOf("N")
+    private var lastCompassUiUpdateMs = 0L
 
     private val locationPermissionLauncher =
         registerForActivityResult(
@@ -117,6 +119,9 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         compassManager.initialize()
         compassManager.listener = object : CompassManager.Listener {
             override fun onHeadingChanged(heading: Float, direction: String) {
+                val now = SystemClock.uptimeMillis()
+                if (now - lastCompassUiUpdateMs < 33L) return
+                lastCompassUiUpdateMs = now
                 composeCompassHeading = heading
                 composeCompassDirection = direction
                 mapManager.updatePointer(
