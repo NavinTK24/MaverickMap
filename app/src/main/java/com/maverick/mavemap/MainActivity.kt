@@ -10,13 +10,16 @@ import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.padding
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.unit.dp
 import androidx.compose.runtime.*
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import com.maverick.mavemap.compass.CompassManager
 import com.maverick.mavemap.location.LocationManager
@@ -35,6 +38,10 @@ import org.osmdroid.views.MapView
 
 class MainActivity : ComponentActivity(), SensorEventListener {
 
+    private val mapPreferences by lazy {
+        getSharedPreferences("mavemap_map_preferences", MODE_PRIVATE)
+    }
+
     private lateinit var mapView: MapView
     private lateinit var mapManager: MapManager
     private lateinit var mapRotation: MapRotation
@@ -45,6 +52,8 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     private lateinit var navigationManager: NavigationManager
     private lateinit var trackingManager: TrackingManager
     private var gnssStateListener: ((Boolean) -> Unit)? = null
+    private var composeCompassHeading by mutableFloatStateOf(0f)
+    private var composeCompassDirection by mutableStateOf("N")
 
     private val locationPermissionLauncher =
         registerForActivityResult(
@@ -71,11 +80,26 @@ class MainActivity : ComponentActivity(), SensorEventListener {
             applicationContext,
             getSharedPreferences("osmdroid", MODE_PRIVATE)
         )
+        Configuration.getInstance().userAgentValue = "MAVEMap/1.0"
 
         mapView = MapView(this)
 
         mapManager = MapManager(this, mapView)
-        mapManager.initialize()
+        val savedTheme = if (
+            mapPreferences.getString("map_theme", MapManager.MapTheme.LIGHT.name) ==
+            MapManager.MapTheme.DARK.name
+        ) {
+            MapManager.MapTheme.DARK
+        } else {
+            MapManager.MapTheme.LIGHT
+        }
+        mapManager.initialize(
+            if (savedTheme == MapManager.MapTheme.DARK && mapManager.hasStadiaMapsApiKey) {
+                savedTheme
+            } else {
+                MapManager.MapTheme.LIGHT
+            }
+        )
 
         mapRotation = MapRotation(mapView) {
             mapManager.updateMapRotation(it)
@@ -93,6 +117,8 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         compassManager.initialize()
         compassManager.listener = object : CompassManager.Listener {
             override fun onHeadingChanged(heading: Float, direction: String) {
+                composeCompassHeading = heading
+                composeCompassDirection = direction
                 mapManager.updatePointer(
                     phoneHeading = heading,
                     targetHeading = mapManager.targetPointerHeading
@@ -136,6 +162,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
                 var routeMessage by remember { mutableStateOf<String?>(null) }
                 var gnssEnabled by remember { mutableStateOf(locationManager.isEnabled) }
                 var tracking by remember { mutableStateOf(trackingManager.isTracking) }
+                var mapTheme by remember { mutableStateOf(mapManager.mapTheme) }
 
                 DisposableEffect(Unit) {
                     gnssStateListener = { gnssEnabled = it }
@@ -159,6 +186,15 @@ class MainActivity : ComponentActivity(), SensorEventListener {
                                 if (route != null) {
                                     mapManager.showRoute(route.points)
                                     navigationManager.setRoute(route)
+                                    selectedDestination?.let { destination ->
+                                        trackingManager.setPlannedRoute(
+                                            points = route.points,
+                                            destinationName = destination.name,
+                                            destination = destination.point,
+                                            distanceKm = route.distanceKm,
+                                            durationMinutes = route.durationMinutes
+                                        )
+                                    }
                                     routeInfo = navigationManager.routeInfo
                                     routeMessage = null
                                 } else {
@@ -179,12 +215,46 @@ class MainActivity : ComponentActivity(), SensorEventListener {
                 }
 
                 CompassView(
-                    heading = if (::compassManager.isInitialized) compassManager.heading else 0f,
-                    direction = if (::compassManager.isInitialized) compassManager.direction else "N",
+                    heading = composeCompassHeading,
+                    direction = composeCompassDirection,
                     modifier = Modifier
                         .align(Alignment.TopEnd)
                         .then(Modifier)
                 )
+
+                androidx.compose.foundation.layout.Box(
+                    modifier = Modifier
+                        .align(Alignment.TopEnd)
+                        .padding(top = 116.dp, end = 12.dp)
+                        .clickable {
+                            val nextTheme = if (mapTheme == MapManager.MapTheme.LIGHT) {
+                                MapManager.MapTheme.DARK
+                            } else {
+                                MapManager.MapTheme.LIGHT
+                            }
+                            if (nextTheme == MapManager.MapTheme.DARK &&
+                                !mapManager.hasStadiaMapsApiKey
+                            ) {
+                                Toast.makeText(
+                                    this@MainActivity,
+                                    "Configure stadiaMapsApiKey in local.properties, then rebuild.",
+                                    Toast.LENGTH_LONG
+                                ).show()
+                            } else {
+                                mapManager.setMapTheme(nextTheme)
+                                mapTheme = nextTheme
+                                mapPreferences.edit()
+                                    .putString("map_theme", nextTheme.name)
+                                    .apply()
+                            }
+                        }
+                ) {
+                    androidx.compose.material3.Text(
+                        text = if (mapTheme == MapManager.MapTheme.LIGHT) "🌙" else "☀",
+                        color = androidx.compose.ui.graphics.Color.White,
+                        fontSize = 22.sp
+                    )
+                }
 
                 androidx.compose.foundation.layout.Box(Modifier.fillMaxSize()) {
                     SearchDialog(

@@ -8,17 +8,34 @@ import org.osmdroid.views.MapView
 import org.osmdroid.views.overlay.Marker
 import org.osmdroid.views.overlay.Polyline
 import android.location.Location
+import android.graphics.Color
+import org.osmdroid.tileprovider.tilesource.XYTileSource
+import org.osmdroid.views.overlay.gestures.RotationGestureOverlay
+import com.maverick.mavemap.BuildConfig
 
 class MapManager(
     private val context: Context,
     private val mapView: MapView
 ) {
+    enum class MapTheme {
+        LIGHT,
+        DARK
+    }
+
     private lateinit var locationMarker: HeadingArrowOverlay
     private var centered = false
     private var routePolyline: Polyline? = null
     private var destinationMarker: Marker? = null
     private var trackingPolyline: Polyline? = null
     private var lastTrackingPoint: GeoPoint? = null
+    private var routePoints: List<GeoPoint> = emptyList()
+    private var trackingPoints: List<GeoPoint> = emptyList()
+
+    var mapTheme: MapTheme = MapTheme.LIGHT
+        private set
+
+    val hasStadiaMapsApiKey: Boolean
+        get() = BuildConfig.STADIA_MAPS_API_KEY.isNotBlank()
 
     var mapRotation: Float = 0f
         private set
@@ -28,10 +45,18 @@ class MapManager(
 
     private var currentPhoneHeading = 0f
     private var currentLocation: GeoPoint? = null
+    private lateinit var rotationGestureOverlay: RotationGestureOverlay
 
-    fun initialize() {
+    fun initialize(initialTheme: MapTheme = MapTheme.LIGHT) {
+        mapTheme = initialTheme
+        applyTileSource(initialTheme)
         mapView.setMultiTouchControls(true)
         mapView.controller.setZoom(18.0)
+
+        rotationGestureOverlay = RotationGestureOverlay(mapView).apply {
+            isEnabled = true
+        }
+        mapView.overlays.add(rotationGestureOverlay)
 
         locationMarker = HeadingArrowOverlay(
             ContextCompat.getDrawable(
@@ -41,6 +66,16 @@ class MapManager(
         )
         mapView.overlays.add(locationMarker)
         updatePointer(currentPhoneHeading, targetPointerHeading)
+    }
+
+    fun setMapTheme(theme: MapTheme) {
+        if (theme == MapTheme.DARK && !hasStadiaMapsApiKey) return
+        if (mapTheme == theme) return
+        mapTheme = theme
+        applyTileSource(theme)
+        routePolyline?.color = routeColor(theme)
+        trackingPolyline?.color = trackingColor(theme)
+        mapView.invalidate()
     }
 
     fun updateLocation(latitude: Double, longitude: Double) {
@@ -78,7 +113,8 @@ class MapManager(
         routePolyline?.let { mapView.overlays.remove(it) }
 
         val polyline = Polyline(mapView)
-        polyline.color = ContextCompat.getColor(context, android.R.color.holo_blue_dark)
+        routePoints = points.toList()
+        polyline.color = routeColor(mapTheme)
         polyline.width = 10f
         polyline.setPoints(points)
         routePolyline = polyline
@@ -106,17 +142,19 @@ class MapManager(
         destinationMarker?.let { mapView.overlays.remove(it) }
         routePolyline = null
         destinationMarker = null
+        routePoints = emptyList()
         mapView.invalidate()
     }
 
     fun startTracking() {
         trackingPolyline?.let { mapView.overlays.remove(it) }
         trackingPolyline = Polyline(mapView).apply {
-            color = ContextCompat.getColor(context, android.R.color.holo_green_light)
+            color = trackingColor(mapTheme)
             width = 8f
         }
         mapView.overlays.add(trackingPolyline)
         lastTrackingPoint = null
+        trackingPoints = emptyList()
         mapView.invalidate()
     }
 
@@ -135,6 +173,7 @@ class MapManager(
         }
         val polyline = trackingPolyline ?: return
         polyline.addPoint(point)
+        trackingPoints = trackingPoints + point
         lastTrackingPoint = point
         mapView.invalidate()
     }
@@ -148,5 +187,42 @@ class MapManager(
         var result = value % 360f
         if (result < 0f) result += 360f
         return result
+    }
+
+    private fun applyTileSource(theme: MapTheme) {
+        val tileSource = when (theme) {
+            MapTheme.LIGHT -> XYTileSource(
+                "OpenStreetMap Standard",
+                0,
+                19,
+                256,
+                ".png",
+                arrayOf("https://tile.openstreetmap.org/")
+            )
+            MapTheme.DARK -> object : XYTileSource(
+                "Stadia Alidade Smooth Dark",
+                0,
+                19,
+                256,
+                ".png",
+                arrayOf("https://tiles.stadiamaps.com/tiles/alidade_smooth_dark/")
+            ) {
+                override fun getTileURLString(mapTileIndex: Long): String {
+                    return super.getTileURLString(mapTileIndex) +
+                        "?api_key=${BuildConfig.STADIA_MAPS_API_KEY}"
+                }
+            }
+        }
+        mapView.setTileSource(tileSource)
+    }
+
+    private fun routeColor(theme: MapTheme): Int = when (theme) {
+        MapTheme.LIGHT -> Color.rgb(0, 92, 220)
+        MapTheme.DARK -> Color.rgb(255, 193, 7)
+    }
+
+    private fun trackingColor(theme: MapTheme): Int = when (theme) {
+        MapTheme.LIGHT -> Color.rgb(0, 125, 55)
+        MapTheme.DARK -> Color.rgb(80, 220, 150)
     }
 }

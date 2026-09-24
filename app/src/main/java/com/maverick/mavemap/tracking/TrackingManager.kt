@@ -12,9 +12,9 @@ import android.location.LocationManager
 import android.os.Build
 import android.os.SystemClock
 import android.util.Log
+import org.osmdroid.util.GeoPoint
 import java.io.BufferedWriter
 import java.io.File
-import java.io.FileWriter
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -35,6 +35,7 @@ class TrackingManager(
     private val locationManager =
         appContext.getSystemService(Context.LOCATION_SERVICE) as LocationManager
     private val writerExecutor: ExecutorService = Executors.newSingleThreadExecutor()
+    private val storageManager = TrackStorageManager(appContext)
     private val dateFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US).apply {
         timeZone = TimeZone.getTimeZone("UTC")
     }
@@ -47,6 +48,9 @@ class TrackingManager(
     private var satellitesUsed = ""
     private var tracking = false
     private var listener: Listener? = null
+    private var storageSession: TrackStorageManager.Session? = null
+    private val trackPoints = mutableListOf<TrackPoint>()
+    private var plannedRoute: PlannedRoute? = null
 
     private val values = mutableMapOf<Int, FloatArray>()
     private val accuracy = mutableMapOf<Int, Int>()
@@ -112,27 +116,39 @@ class TrackingManager(
     val isTracking: Boolean
         @Synchronized get() = tracking
 
+    fun setPlannedRoute(
+        points: List<GeoPoint>,
+        destinationName: String,
+        destination: GeoPoint,
+        distanceKm: Double,
+        durationMinutes: Double
+    ) {
+        synchronized(lock) {
+            plannedRoute = PlannedRoute(
+                points.toList(), destinationName, destination, distanceKm, durationMinutes
+            )
+        }
+    }
+
     fun start(): File? {
         synchronized(lock) {
-            if (tracking) return sessionFile
-            val directory = File(appContext.getExternalFilesDir(null), "tracks")
-            if (!directory.exists() && !directory.mkdirs()) {
-                Log.e(TAG, "Unable to create tracking directory")
-                return null
-            }
-            val file = File(directory, "track_${System.currentTimeMillis()}.csv")
+            if (tracking) return null
             try {
-                writer = BufferedWriter(FileWriter(file, false))
+                val sessionId = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+                storageSession = storageManager.createSession(sessionId)
+                writer = storageSession?.csv?.writer
                 writer?.write(HEADER)
                 writer?.newLine()
                 writer?.flush()
             } catch (exception: Exception) {
                 Log.e(TAG, "Unable to start tracking", exception)
-                writer?.closeQuietly()
+                storageSession?.let { closeSessionFiles(it) }
+                storageSession = null
                 writer = null
                 return null
             }
-            sessionFile = file
+            sessionFile = File("Documents/Maverick/Tracks/${storageSession?.sessionId ?: ""}")
+            trackPoints.clear()
             sessionStartNs = SystemClock.elapsedRealtimeNanos()
             tracking = true
             registerSensors()
@@ -144,8 +160,8 @@ class TrackingManager(
             } catch (exception: SecurityException) {
                 Log.w(TAG, "GNSS callbacks unavailable", exception)
             }
-            listener?.onTrackingChanged(true, file)
-            return file
+            listener?.onTrackingChanged(true, sessionFile)
+            return sessionFile
         }
     }
 
@@ -163,25 +179,38 @@ class TrackingManager(
                 Log.w(TAG, "Unable to unregister GNSS callbacks", exception)
             }
             val closingWriter = writer
+            val sessionToClose = storageSession
+            val pointsToExport = trackPoints.toList()
             writer = null
             writerExecutor.submit {
-                closingWriter?.let {
-                    try {
-                        it.flush()
-                        it.closeQuietly()
-                    } catch (exception: Exception) {
-                        Log.e(TAG, "Unable to close tracking file", exception)
+                try {
+                    closingWriter?.flush()
+                    sessionToClose?.let { current ->
+                        writeGeoJson(current.geoJson.writer, pointsToExport, current.sessionId)
+                        writeGpx(current.gpx.writer, pointsToExport)
+                        plannedRoute?.let { route ->
+                            writePlannedRoute(current.plannedRoute.writer, route)
+                        }
+                        closeSessionFiles(current)
                     }
+                } catch (exception: Exception) {
+                    Log.e(TAG, "Unable to finalize tracking files", exception)
                 }
             }
+            storageSession = null
             listener?.onTrackingChanged(false, sessionFile)
         }
     }
 
     fun recordLocation(location: Location) {
         synchronized(lock) {
-            if (!tracking) return
+            if (!tracking || !location.latitude.isFinite() || !location.longitude.isFinite() || location.accuracy > 100f) return
             latestLocation = Location(location)
+            val point = GeoPoint(location.latitude, location.longitude)
+            val previous = trackPoints.lastOrNull()?.point
+            if (previous == null || previous.distanceToAsDouble(point) <= 300.0) {
+                trackPoints.add(TrackPoint(point, location.time, location.altitude))
+            }
             writeRow("location", location.elapsedRealtimeNanos, "")
         }
     }
@@ -270,6 +299,35 @@ class TrackingManager(
         ).joinToString(",") { quoteCsv(it.orEmpty()) }
     }
 
+    private fun writeGeoJson(writer: BufferedWriter, points: List<TrackPoint>, sessionId: String) {
+        val coordinates = points.joinToString(",") { "[${it.point.longitude},${it.point.latitude}]" }
+        writer.write("{\"type\":\"Feature\",\"properties\":{\"session_id\":\"$sessionId\",\"source\":\"GNSS\"},\"geometry\":{\"type\":\"LineString\",\"coordinates\":[$coordinates]}}")
+        writer.newLine()
+    }
+
+    private fun writeGpx(writer: BufferedWriter, points: List<TrackPoint>) {
+        writer.write("<?xml version=\"1.0\" encoding=\"UTF-8\"?><gpx version=\"1.1\" creator=\"MAVEMap\" xmlns=\"http://www.topografix.com/GPX/1/1\"><trk><name>MAVEMap GNSS track</name><trkseg>")
+        points.forEach { point ->
+            writer.write("<trkpt lat=\"${point.point.latitude}\" lon=\"${point.point.longitude}\">")
+            if (point.altitude.isFinite()) writer.write("<ele>${point.altitude}</ele>")
+            if (point.timeMs > 0L) writer.write("<time>${dateFormat.format(Date(point.timeMs))}</time>")
+            writer.write("</trkpt>")
+        }
+        writer.write("</trkseg></trk></gpx>")
+        writer.newLine()
+    }
+
+    private fun writePlannedRoute(writer: BufferedWriter, route: PlannedRoute) {
+        val coordinates = route.points.joinToString(",") { "[${it.longitude},${it.latitude}]" }
+        val name = route.destinationName.replace("\"", "\\\"")
+        writer.write("{\"type\":\"Feature\",\"properties\":{\"destination_name\":\"$name\",\"destination_latitude\":${route.destination.latitude},\"destination_longitude\":${route.destination.longitude},\"distance_km\":${route.distanceKm},\"estimated_time_minutes\":${route.durationMinutes},\"source\":\"Valhalla\"},\"geometry\":{\"type\":\"LineString\",\"coordinates\":[$coordinates]}}")
+        writer.newLine()
+    }
+
+    private fun closeSessionFiles(session: TrackStorageManager.Session) {
+        session.closePublishedFiles()
+    }
+
     fun close() {
         stop()
         writerExecutor.shutdown()
@@ -295,6 +353,20 @@ class TrackingManager(
     private fun BufferedWriter.closeQuietly() {
         try { close() } catch (_: Exception) { }
     }
+
+    private data class PlannedRoute(
+        val points: List<GeoPoint>,
+        val destinationName: String,
+        val destination: GeoPoint,
+        val distanceKm: Double,
+        val durationMinutes: Double
+    )
+
+    private data class TrackPoint(
+        val point: GeoPoint,
+        val timeMs: Long,
+        val altitude: Double
+    )
 
     companion object {
         private const val TAG = "TrackingManager"
